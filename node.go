@@ -1,4 +1,4 @@
-package main
+package nexus
 
 import (
 	"encoding/json"
@@ -45,6 +45,7 @@ type Node struct {
 	Network       map[string]NetworkedNode
 	ReadStream    chan NodeMsg
 	ConnectStream chan string
+	GroupLimit    int
 }
 
 type BroadcastStream struct {
@@ -96,7 +97,7 @@ func (mg MulticastGroup) Stream(readStream chan NodeMsg, nodeId string) {
 				if cm.Dst.Equal(mg.Addr.IP) {
 					// log.Printf("Group: %v\n", cm)
 
-					log.Printf("Group %v got MSG %v\n", msg.Msg["groupid"], msg)
+					// log.Printf("Group %v got MSG %v\n", msg.Msg["groupid"], msg)
 					readStream <- msg
 					// joined group, do something
 				} else {
@@ -253,8 +254,16 @@ func (n *Node) ReadStreamHandler() {
 			groupPort, _ := strconv.Atoi(groupPortString)
 
 			if _, ok := n.Groups[groupID]; !ok {
-				log.Printf("adding group: %v\n", groupID)
-				n.NewGroup(groupID, groupIP, groupPort)
+				if len(n.Groups) <= n.GroupLimit {
+					log.Printf("adding group: %v\n", groupID)
+					n.NewGroup(groupID, groupIP, groupPort)
+				} else {
+					log.Printf("Needs a fresh group\n")
+					nid := n.NewGroup("", net.IPv4(224, 0, 0, byte(rand.Intn(249))), 0)
+					log.Printf("NID: %v\n", nid)
+					n.ConnectToGroup(nid)
+				}
+
 			}
 		}
 	}
