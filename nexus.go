@@ -12,18 +12,18 @@ func NewNexusNode() *Node {
 
 func RunNexusNode(nx *Node) {
 	ConnectToGroup(*nx.Broadcast, nx.Intf)
-	go nx.Broadcast.Stream(nx.ReadStream, nx.Id)
+	go nx.Broadcast.Stream(nx.ReadStream, nx)
 	go func() {
 		for newConn := range nx.ConnectStream {
-			go nx.Groups[newConn].Stream(nx.ReadStream, nx.Id)
+			go nx.Groups[newConn].Stream(nx.ReadStream, nx)
 			nx.Groups[newConn].WriteStream <- []byte(
-				NodeMsg{
+				NodeMessage{
 					Msg: map[string]string{
 						"id":      nx.Id,
 						"groupid": newConn,
 						"msg":     "joined group",
 					},
-					Dst: nx.Groups[newConn].Addr,
+					DestinationAddr: nx.Groups[newConn].Addr,
 				}.ToJson(),
 			)
 		}

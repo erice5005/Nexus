@@ -13,13 +13,20 @@ import (
 	"golang.org/x/net/ipv4"
 )
 
-type NodeMsg struct {
-	Dst *net.UDPAddr
-	Src *net.UDPAddr
-	Msg map[string]string
+// type NodeMessage struct {
+// 	Dst *net.UDPAddr
+// 	Src *net.UDPAddr
+// 	Msg map[string]string
+// }
+type NodeMessage struct {
+	OriginId        string
+	DestinationAddr *net.UDPAddr
+	DestinationId   string
+	SourceAddr      *net.UDPAddr
+	Msg             map[string]string
 }
 
-func (nm NodeMsg) ToJson() string {
+func (nm NodeMessage) ToJson() string {
 	encd, err := json.Marshal(nm)
 	if err != nil {
 		return ""
@@ -27,11 +34,11 @@ func (nm NodeMsg) ToJson() string {
 	return string(encd)
 }
 
-func MsgFromJson(inp []byte) NodeMsg {
-	var out NodeMsg
+func MsgFromJson(inp []byte) NodeMessage {
+	var out NodeMessage
 	err := json.Unmarshal(inp, &out)
 	if err != nil {
-		return NodeMsg{}
+		return NodeMessage{}
 	}
 	return out
 }
@@ -43,7 +50,7 @@ type Node struct {
 	Groups        map[string]MulticastGroup
 	Intf          *net.Interface
 	Network       map[string]NetworkedNode
-	ReadStream    chan NodeMsg
+	ReadStream    chan NodeMessage
 	ConnectStream chan string
 	GroupLimit    int
 }
@@ -67,12 +74,12 @@ type MulticastGroup struct {
 }
 
 type NetworkedNode struct {
-	Id       string
-	LastSeen time.Time
+	Id        string
+	LastSeen  time.Time
+	SeenNodes map[string]NetworkedNode
 }
 
-func (mg MulticastGroup) Stream(readStream chan NodeMsg, nodeId string) {
-	log.Printf("start stream: %v\n", mg.Id)
+func (mg MulticastGroup) Stream(readStream chan NodeMessage, node *Node) {
 	go func() {
 		b := make([]byte, 1500)
 		for {
@@ -83,7 +90,10 @@ func (mg MulticastGroup) Stream(readStream chan NodeMsg, nodeId string) {
 				// error handling
 			}
 			msg := MsgFromJson(b[:n])
-			if msg.Msg["id"] == nodeId {
+			if msg.OriginId == "" {
+				continue
+			}
+			if msg.OriginId == node.Id {
 				continue
 			}
 			if src == mg.IPV4.LocalAddr() {
@@ -95,29 +105,26 @@ func (mg MulticastGroup) Stream(readStream chan NodeMsg, nodeId string) {
 			}
 			if cm.Dst.IsMulticast() {
 				if cm.Dst.Equal(mg.Addr.IP) {
-					// log.Printf("Group: %v\n", cm)
-
-					// log.Printf("Group %v got MSG %v\n", msg.Msg["groupid"], msg)
 					readStream <- msg
-					// joined group, do something
 				} else {
 					log.Printf("unknown msg: %v\n", string(b[:n]))
-					// unknown group, discard
 					continue
 				}
 			}
 		}
 	}()
 	go func() {
-		testTicker := time.NewTicker(1 * time.Second)
+		testTicker := time.NewTicker(10 * time.Second)
 		for range testTicker.C {
+			marshedNet, _ := json.Marshal(node.Network)
 			mg.WriteStream <- []byte(
-				NodeMsg{
+				NodeMessage{
+					OriginId: node.Id,
 					Msg: map[string]string{
-						"id":      nodeId,
-						"groupid": mg.Id,
-						"type":    "ping",
-						// "string": "i'm a test message",
+						"id":        node.Id,
+						"groupid":   mg.Id,
+						"type":      "ping",
+						"seenNodes": string(marshedNet),
 					},
 				}.ToJson(),
 			)
@@ -155,10 +162,16 @@ func (n *Node) RunBroadcastNet() {
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		for range ticker.C {
+
+			marshedNet, _ := json.Marshal(n.Network)
+
 			n.Broadcast.WriteStream <- []byte(
-				NodeMsg{
+				NodeMessage{
+					OriginId: n.Id,
 					Msg: map[string]string{
-						"id": n.Id,
+						"id":        n.Id,
+						"type":      "seenUpdate",
+						"seenNodes": string(marshedNet),
 					},
 				}.ToJson(),
 			)
@@ -204,49 +217,48 @@ func (n *Node) GroupInitWatch() {
 
 func (n *Node) ReadStreamHandler() {
 	for msg := range n.ReadStream {
-		if msg.Msg["id"] == n.Id {
+		if msg.OriginId == n.Id {
 			continue
 		}
 
 		// log.Printf("Got: %v\n", msg)
-		if _, ok := n.Network[msg.Msg["id"]]; !ok {
-			log.Printf("I'm new: %v\n", msg.Msg["id"])
-			n.Network[msg.Msg["id"]] = NetworkedNode{
-				Id: msg.Msg["id"],
+		if _, ok := n.Network[msg.OriginId]; !ok {
+			log.Printf("I'm new: %v\n", msg.OriginId)
+			n.Network[msg.OriginId] = NetworkedNode{
+				Id:        msg.OriginId,
+				SeenNodes: make(map[string]NetworkedNode),
 			}
-			// log.Printf("group len: %v\n", len(n.Groups))
-			if len(n.Groups) > 0 {
-				for _, ngg := range n.Groups {
-					// toSend, _ := json.Marshal(ngg)
-					// log.Printf("ngg: %v\n", ngg)
-					n.Broadcast.WriteStream <- []byte(NodeMsg{
-						Msg: map[string]string{
-							"id":          n.Id,
-							"groupip":     ngg.IP.String(),
-							"groupport":   strconv.Itoa(ngg.Port),
-							"groupid":     ngg.Id,
-							"isGroupInfo": "true",
-						},
-					}.ToJson())
-				}
+			// if len(n.Groups) > 0 {
+			for _, ngg := range n.Groups {
+				n.Broadcast.WriteStream <- []byte(NodeMessage{
+					OriginId: n.Id,
+					Msg: map[string]string{
+						"id":          n.Id,
+						"groupip":     ngg.IP.String(),
+						"groupport":   strconv.Itoa(ngg.Port),
+						"groupid":     ngg.Id,
+						"isGroupInfo": "true",
+					},
+				}.ToJson())
 			}
+			// }
 		}
 		// mark off the last time the node has been seen
-		nn := n.Network[msg.Msg["id"]]
+		nn := n.Network[msg.OriginId]
 		nn.LastSeen = time.Now()
-		n.Network[msg.Msg["id"]] = nn
+		n.Network[msg.OriginId] = nn
 
 		// check for group info in the message
 		// it it exists, create a new group and add it to the list
 		// log.Printf("MSG: %v\n", msg)
-		if msg.Dst != nil {
+		if msg.DestinationAddr != nil {
 			continue
 		}
 		if val, ok := msg.Msg["isGroupInfo"]; ok {
 			if val != "true" {
 				continue
 			}
-
+			log.Printf("Got group info: %v\n", msg.Msg)
 			groupIP := net.ParseIP(msg.Msg["groupip"])
 			groupPortString := msg.Msg["groupport"]
 			groupID := msg.Msg["groupid"]
@@ -254,7 +266,7 @@ func (n *Node) ReadStreamHandler() {
 			groupPort, _ := strconv.Atoi(groupPortString)
 
 			if _, ok := n.Groups[groupID]; !ok {
-				if len(n.Groups) <= n.GroupLimit {
+				if len(n.Groups) <= n.GroupLimit || n.GroupLimit == 0 {
 					log.Printf("adding group: %v\n", groupID)
 					n.NewGroup(groupID, groupIP, groupPort)
 				} else {
@@ -266,10 +278,22 @@ func (n *Node) ReadStreamHandler() {
 
 			}
 		}
+		if val, ok := msg.Msg["seenNodes"]; ok {
+			log.Printf("val: %v\n", string(val))
+			var seenNodes map[string]NetworkedNode
+			err := json.Unmarshal([]byte(val), &seenNodes)
+			if err != nil {
+				log.Printf("error unmarshalling seennodes from: %v\n", val)
+				continue
+			}
+			nn := n.Network[msg.OriginId]
+			nn.SeenNodes = seenNodes
+			n.Network[msg.OriginId] = nn
+		}
 	}
 }
 
-func (bs *BroadcastStream) Listen(st chan NodeMsg) {
+func (bs *BroadcastStream) Listen(st chan NodeMessage) {
 	for {
 		b := make([]byte, 2500)
 		n, src, err := bs.ListenConn.ReadFromUDP(b) //n, src
@@ -277,7 +301,7 @@ func (bs *BroadcastStream) Listen(st chan NodeMsg) {
 			log.Printf("Broadcast read err: %v\n", err)
 		}
 		msg := MsgFromJson(b[:n])
-		msg.Src = src
+		msg.SourceAddr = src
 
 		st <- msg
 		// log.Printf("%v bytes from %v: %v\n", n, src, string(b[:n]))
@@ -310,10 +334,11 @@ func NewNode(broadcastAddr string) *Node {
 		Id:   nodeid,
 		Intf: castIntf,
 		// Broadcast:     broadcastNet,
-		ReadStream:    make(chan NodeMsg, 10),
+		ReadStream:    make(chan NodeMessage, 10),
 		Network:       make(map[string]NetworkedNode),
 		Groups:        make(map[string]MulticastGroup),
 		ConnectStream: make(chan string, 10),
+		GroupLimit:    0,
 	}
 }
 
