@@ -3,7 +3,6 @@ package nexus
 import (
 	"encoding/json"
 	"log"
-	"math/rand"
 	"net"
 	"strconv"
 	"strings"
@@ -13,309 +12,97 @@ import (
 	"golang.org/x/net/ipv4"
 )
 
-// type NodeMessage struct {
-// 	Dst *net.UDPAddr
-// 	Src *net.UDPAddr
-// 	Msg map[string]string
-// }
-type NodeMessage struct {
-	OriginId        string
-	DestinationAddr *net.UDPAddr
-	DestinationId   string
-	SourceAddr      *net.UDPAddr
-	Msg             map[string]string
+type NodeConfig struct {
+	Groups int
+	Intf   *net.Interface
 }
-
-func (nm NodeMessage) ToJson() string {
-	encd, err := json.Marshal(nm)
-	if err != nil {
-		return ""
-	}
-	return string(encd)
-}
-
-func MsgFromJson(inp []byte) NodeMessage {
-	var out NodeMessage
-	err := json.Unmarshal(inp, &out)
-	if err != nil {
-		return NodeMessage{}
-	}
-	return out
-}
-
 type Node struct {
-	Id string
-	// Broadcast     *BroadcastStream
-	Broadcast     *MulticastGroup
-	Groups        map[string]MulticastGroup
-	Intf          *net.Interface
-	Network       map[string]NetworkedNode
-	ReadStream    chan NodeMessage
-	ConnectStream chan string
-	GroupLimit    int
+	Id             string
+	Config         NodeConfig
+	Network        map[string]NetworkedNode
+	BroadcastGroup ConnectedNexusGroup
+	Groups         map[string]ConnectedNexusGroup
+	ConnectStream  chan NexusGroup
 }
 
-type BroadcastStream struct {
-	Addr        *net.UDPAddr
-	WriteConn   *net.UDPConn
-	ListenConn  *net.UDPConn
-	WriteStream chan []byte
-}
-
-type MulticastGroup struct {
-	IP          net.IP
-	Port        int
-	Conn        net.PacketConn
-	IPV4        *ipv4.PacketConn
-	Connected   bool
-	Addr        *net.UDPAddr
-	Id          string
-	WriteStream chan []byte
+type ConnectedNexusGroup struct {
+	Group         NexusGroup
+	Output        chan NodeMessage
+	Input         chan interface{}
+	InputHandler  func(out chan interface{}, cm *ipv4.ControlMessage, data []byte, src net.Addr)
+	OutputHandler func(out chan interface{})
 }
 
 type NetworkedNode struct {
-	Id        string
-	LastSeen  time.Time
-	SeenNodes map[string]NetworkedNode
+	Id       string
+	LastSeen time.Time
+	Groups   map[string]NexusGroup
 }
 
-func (mg MulticastGroup) Stream(readStream chan NodeMessage, node *Node) {
-	go func() {
-		b := make([]byte, 1500)
-		for {
-			n, cm, src, err := mg.IPV4.ReadFrom(b)
-			if err != nil {
-				log.Printf("read err: %v\n", err)
-				continue
-				// error handling
-			}
-			msg := MsgFromJson(b[:n])
-			if msg.OriginId == "" {
-				continue
-			}
-			if msg.OriginId == node.Id {
-				continue
-			}
-			if src == mg.IPV4.LocalAddr() {
-				continue
-			}
-			// log.Printf("dst: %v\n", cm)
-			if cm.Dst == nil {
-				continue
-			}
-			if cm.Dst.IsMulticast() {
-				if cm.Dst.Equal(mg.Addr.IP) {
-					readStream <- msg
-				} else {
-					log.Printf("unknown msg: %v\n", string(b[:n]))
-					continue
-				}
-			}
-		}
-	}()
-	go func() {
-		testTicker := time.NewTicker(10 * time.Second)
-		for range testTicker.C {
-			marshedNet, _ := json.Marshal(node.Network)
-			mg.WriteStream <- []byte(
-				NodeMessage{
-					OriginId: node.Id,
-					Msg: map[string]string{
-						"id":        node.Id,
-						"groupid":   mg.Id,
-						"type":      "ping",
-						"seenNodes": string(marshedNet),
-					},
-				}.ToJson(),
-			)
-		}
-	}()
-	func() {
-		for msg := range mg.WriteStream {
-			// log.Printf("writing msg: %v\n", string(msg))
-			_, err := mg.IPV4.WriteTo(msg, nil, mg.Addr)
-			if err != nil {
-				log.Printf("write err: %v\n", err)
-			}
-		}
-	}()
-	log.Printf("ended: %v\n", time.Now())
+type NexusGroup struct {
+	Id         string
+	Address    NexusGroupAddress
+	Connection NexusGroupConnection
+	Private    bool
+}
+type NexusGroupConnection struct {
+	IPV4      *ipv4.PacketConn
+	Conn      net.PacketConn
+	Connected bool
+}
+type NexusGroupAddress struct {
+	IP      net.IP
+	Port    int
+	Address *net.UDPAddr
 }
 
-func NewBroadcastStream(addr string) *BroadcastStream {
-	targetAddr, _ := net.ResolveUDPAddr("udp", addr)
+type NodeMessage struct {
+	SenderId string
+	Routing  MessageRouting
+	Data     map[string]interface{}
+}
 
-	writeConn, _ := net.DialUDP("udp", nil, targetAddr)
-	listenConn, _ := net.ListenMulticastUDP("udp", nil, targetAddr)
-	listenConn.SetReadBuffer(2500)
+type NodeMessageType int64
 
-	return &BroadcastStream{
-		Addr:        targetAddr,
-		WriteConn:   writeConn,
-		ListenConn:  listenConn,
-		WriteStream: make(chan []byte, 10),
+const (
+	Ping       NodeMessageType = 0
+	Connect    NodeMessageType = 1
+	Disconnect NodeMessageType = 2
+	Message    NodeMessageType = 3
+	GroupInfo  NodeMessageType = 4
+)
+
+type MessageRouting struct {
+	DestinationAddress *net.UDPAddr
+	DestinationId      string
+	SourceAddress      *net.UDPAddr
+	MessageType        NodeMessageType
+}
+
+func (msg NodeMessage) toJSON() []byte {
+	marshed, err := json.Marshal(msg)
+	if err != nil {
+		return []byte("")
 	}
 
+	return marshed
 }
 
-func (n *Node) RunBroadcastNet() {
-	go func() {
-		ticker := time.NewTicker(1 * time.Second)
-		for range ticker.C {
-
-			marshedNet, _ := json.Marshal(n.Network)
-
-			n.Broadcast.WriteStream <- []byte(
-				NodeMessage{
-					OriginId: n.Id,
-					Msg: map[string]string{
-						"id":        n.Id,
-						"type":      "seenUpdate",
-						"seenNodes": string(marshedNet),
-					},
-				}.ToJson(),
-			)
-		}
-	}()
-	// go n.Broadcast.Listen(n.ReadStream)
-	// go n.Broadcast.Write()
-}
-
-func (n *Node) GroupInitWatch() {
-	ticker := time.NewTicker(1 * time.Second)
-	tryLimit := 3
-	tryCount := 0
-	for range ticker.C {
-		if len(n.Groups) > 0 {
-			break
-		}
-		// if len(n.Network) == 0 {
-		tryCount++
-		log.Printf("Seen: %v nets and %v groups\n", len(n.Network), len(n.Groups))
-		// Other nodes exist, pull some data from them
-		// }
-		if tryCount == tryLimit {
-			break
-			// Hasn't found anything, need a group created
-		}
+func MsgFromJson(data []byte) NodeMessage {
+	var msg NodeMessage
+	err := json.Unmarshal(data, &msg)
+	if err != nil {
+		return NodeMessage{}
 	}
-	log.Printf("Seen: %v groups\n", len(n.Groups))
-	if len(n.Groups) == 0 {
-		log.Printf("Needs a fresh group\n")
-		nid := n.NewGroup("", net.IPv4(224, 0, 0, byte(rand.Intn(249))), 0)
-		log.Printf("NID: %v\n", nid)
-		n.ConnectToGroup(nid)
-	} else {
-		for _, gg := range n.Groups {
-			log.Printf("connect to: %v\n", gg)
-			if !gg.Connected {
-				n.ConnectToGroup(gg.Id)
-			}
-		}
-	}
+
+	return msg
 }
 
-func (n *Node) ReadStreamHandler() {
-	for msg := range n.ReadStream {
-		if msg.OriginId == n.Id {
-			continue
-		}
-
-		// log.Printf("Got: %v\n", msg)
-		if _, ok := n.Network[msg.OriginId]; !ok {
-			log.Printf("I'm new: %v\n", msg.OriginId)
-			n.Network[msg.OriginId] = NetworkedNode{
-				Id:        msg.OriginId,
-				SeenNodes: make(map[string]NetworkedNode),
-			}
-			// if len(n.Groups) > 0 {
-			for _, ngg := range n.Groups {
-				n.Broadcast.WriteStream <- []byte(NodeMessage{
-					OriginId: n.Id,
-					Msg: map[string]string{
-						"id":          n.Id,
-						"groupip":     ngg.IP.String(),
-						"groupport":   strconv.Itoa(ngg.Port),
-						"groupid":     ngg.Id,
-						"isGroupInfo": "true",
-					},
-				}.ToJson())
-			}
-			// }
-		}
-		// mark off the last time the node has been seen
-		nn := n.Network[msg.OriginId]
-		nn.LastSeen = time.Now()
-		n.Network[msg.OriginId] = nn
-
-		// check for group info in the message
-		// it it exists, create a new group and add it to the list
-		// log.Printf("MSG: %v\n", msg)
-		if msg.DestinationAddr != nil {
-			continue
-		}
-		if val, ok := msg.Msg["isGroupInfo"]; ok {
-			if val != "true" {
-				continue
-			}
-			log.Printf("Got group info: %v\n", msg.Msg)
-			groupIP := net.ParseIP(msg.Msg["groupip"])
-			groupPortString := msg.Msg["groupport"]
-			groupID := msg.Msg["groupid"]
-
-			groupPort, _ := strconv.Atoi(groupPortString)
-
-			if _, ok := n.Groups[groupID]; !ok {
-				if len(n.Groups) <= n.GroupLimit || n.GroupLimit == 0 {
-					log.Printf("adding group: %v\n", groupID)
-					n.NewGroup(groupID, groupIP, groupPort)
-				} else {
-					log.Printf("Needs a fresh group\n")
-					nid := n.NewGroup("", net.IPv4(224, 0, 0, byte(rand.Intn(249))), 0)
-					log.Printf("NID: %v\n", nid)
-					n.ConnectToGroup(nid)
-				}
-
-			}
-		}
-		if val, ok := msg.Msg["seenNodes"]; ok {
-			log.Printf("val: %v\n", string(val))
-			var seenNodes map[string]NetworkedNode
-			err := json.Unmarshal([]byte(val), &seenNodes)
-			if err != nil {
-				log.Printf("error unmarshalling seennodes from: %v\n", val)
-				continue
-			}
-			nn := n.Network[msg.OriginId]
-			nn.SeenNodes = seenNodes
-			n.Network[msg.OriginId] = nn
-		}
+func NewNode(conf NodeConfig, id string) *Node {
+	nodeid := id
+	if nodeid == "" {
+		nodeid = uuid.NewString()
 	}
-}
-
-func (bs *BroadcastStream) Listen(st chan NodeMessage) {
-	for {
-		b := make([]byte, 2500)
-		n, src, err := bs.ListenConn.ReadFromUDP(b) //n, src
-		if err != nil {
-			log.Printf("Broadcast read err: %v\n", err)
-		}
-		msg := MsgFromJson(b[:n])
-		msg.SourceAddr = src
-
-		st <- msg
-		// log.Printf("%v bytes from %v: %v\n", n, src, string(b[:n]))
-	}
-}
-
-func (bs *BroadcastStream) Write() {
-	for msg := range bs.WriteStream {
-		bs.WriteConn.Write(msg)
-	}
-}
-
-func NewNode(broadcastAddr string) *Node {
-	nodeid := uuid.NewString()
 	var castIntf *net.Interface
 	itfs, err := net.Interfaces()
 	if err != nil {
@@ -328,102 +115,280 @@ func NewNode(broadcastAddr string) *Node {
 			castIntf = &itfs[it]
 		}
 	}
+	conf.Intf = castIntf
 
-	// broadcastNet := NewBroadcastStream(broadcastAddr)
-	return &Node{
-		Id:   nodeid,
-		Intf: castIntf,
-		// Broadcast:     broadcastNet,
-		ReadStream:    make(chan NodeMessage, 10),
+	n := &Node{
+		Id:            nodeid,
+		Config:        conf,
 		Network:       make(map[string]NetworkedNode),
-		Groups:        make(map[string]MulticastGroup),
-		ConnectStream: make(chan string, 10),
-		GroupLimit:    0,
+		Groups:        make(map[string]ConnectedNexusGroup),
+		ConnectStream: make(chan NexusGroup, 10),
+	}
+
+	n.BroadcastGroup = ConnectedNexusGroup{
+		Group: NewGroup("broadcast", NexusGroupAddress{
+			IP:   net.IPv4(224, 0, 0, 250),
+			Port: 9999,
+		}),
+		Output:       make(chan NodeMessage, 10),
+		Input:        make(chan interface{}, 10),
+		InputHandler: n.BroadcastInputHandler,
+	}
+
+	return n
+}
+
+func (n Node) HandleConnectStream() {
+	for ng := range n.ConnectStream {
+		if ng.Private {
+			continue
+		}
+		n.ConnectGroup(ng)
 	}
 }
 
-func (n *Node) NewGroup(id string, targetIP net.IP, port int) string {
-
-	// n.Groups[id] = MulticastGroup{
-	// 	IP:          targetIP,
-	// 	Port:        port,
-	// 	Conn:        c,
-	// 	IPV4:        p,
-	// 	Addr:        tg,
-	// 	Id:          id,
-	// 	WriteStream: make(chan []byte, 10),
-	// }
-	if id == "" {
-		id = uuid.NewString()
+func NewGroup(id string, conf NexusGroupAddress) NexusGroup {
+	groupid := id
+	if groupid == "" {
+		groupid = uuid.NewString()
 	}
-	n.Groups[id] = NewGroup(id, targetIP, port)
-	return id
-}
+	if conf.Address == nil {
+		conf.Address = &net.UDPAddr{
+			IP:   conf.IP,
+			Port: conf.Port,
+		}
+	}
 
-func NewGroup(id string, targetIP net.IP, port int) MulticastGroup {
-	c, err := net.ListenPacket("udp", net.JoinHostPort("224.0.0.1", strconv.Itoa(port)))
+	c, err := net.ListenPacket("udp", conf.Address.String())
 	if err != nil {
-		return MulticastGroup{}
+		log.Printf("err: %v\n", err)
+		return NexusGroup{}
 	}
 
 	p := ipv4.NewPacketConn(c)
-
-	if port == 0 {
+	if conf.Port == 0 {
 		hostPortVal := p.LocalAddr()
 		hostSplit := strings.Split(hostPortVal.String(), ":")
 		if len(hostSplit) == 2 {
 			convd, _ := strconv.Atoi(hostSplit[1])
-			port = convd
+			conf.Port = convd
+			conf.Address.Port = conf.Port
 		}
 	}
 
-	tg := &net.UDPAddr{
-		IP:   targetIP,
-		Port: port,
+	return NexusGroup{
+		Id:      groupid,
+		Address: conf,
+		Connection: NexusGroupConnection{
+			Conn: c,
+			IPV4: p,
+		},
 	}
 
-	return MulticastGroup{
-		IP:          targetIP,
-		Port:        port,
-		Conn:        c,
-		IPV4:        p,
-		Addr:        tg,
-		Id:          id,
-		WriteStream: make(chan []byte, 10),
+}
+
+func (ng NexusGroup) Connect(intf *net.Interface) {
+	if err := ng.Connection.IPV4.JoinGroup(intf, ng.Address.Address); err != nil {
+		log.Printf("failed to join group: %v with err: %v\n", ng.Address.Address, err)
+		return
+	}
+	if err := ng.Connection.IPV4.SetControlMessage(ipv4.FlagDst, true); err != nil {
+		log.Printf("failed to set control dst msg on group: %v with err: %v\n", ng.Address.Address, err)
+	}
+	if err := ng.Connection.IPV4.SetControlMessage(ipv4.FlagSrc, true); err != nil {
+		log.Printf("failed to set control src msg on group: %v with err: %v\n", ng.Address.Address, err)
+	}
+	if err := ng.Connection.IPV4.SetMulticastInterface(intf); err != nil {
+		log.Printf("write err: %v\n", err)
 	}
 }
 
-func (n *Node) ConnectToGroup(id string) {
-	targetGroup := n.Groups[id]
+// TODO: Leave group
 
-	// tg := n.Groups[id].Addr
-	ConnectToGroup(targetGroup, n.Intf)
-	log.Printf("finished control flags\n")
-	targetGroup.Connected = true
-	// targetGroup.Stream(n.ReadStream)
-	n.Groups[id] = targetGroup
-	n.ConnectStream <- id
-	log.Printf("group connected: %v\n", id)
+func (ng ConnectedNexusGroup) Run(senderId string) {
+	go func() {
+		b := make([]byte, 1500)
+		for {
+			n, cm, src, err := ng.Group.Connection.IPV4.ReadFrom(b)
+			if err != nil {
+				continue
+			}
+			ng.InputHandler(ng.Input, cm, b[:n], src)
+		}
+	}()
+	log.Printf("Started input\n")
+	// go func() {
+	for msg := range ng.Output {
+		// log.Printf("msg: %v\n", msg)
+		cm := &ipv4.ControlMessage{}
+		msg.SenderId = senderId
+
+		cm.Dst = ng.Group.Address.IP
+		_, err := ng.Group.Connection.IPV4.WriteTo(msg.toJSON(), cm, ng.Group.Address.Address)
+		if err != nil {
+			continue
+		}
+	}
+	// }()
+	log.Printf("run ended: %v\n", ng.Group.Id)
 }
 
-func ConnectToGroup(tg MulticastGroup, intf *net.Interface) {
-	log.Printf("target group: %v\n", tg)
-	if err := tg.IPV4.JoinGroup(intf, tg.Addr); err != nil {
-		log.Printf("failed to join group: %v with err: %v\n", tg.Addr, err)
+func (n Node) BroadcastInputHandler(inputStream chan interface{}, cm *ipv4.ControlMessage, data []byte, src net.Addr) {
+	msg := MsgFromJson(data)
+	if msg.SenderId == "" {
+		return
+	}
+	if msg.SenderId == n.Id {
 		return
 	}
 
-	if err := tg.IPV4.SetControlMessage(ipv4.FlagDst, true); err != nil {
-		log.Printf("failed to set control dst msg on group: %v with err: %v\n", tg.Addr, err)
+	var sourceNode NetworkedNode
+	if val, ok := n.Network[msg.SenderId]; ok {
+		sourceNode = val
+	} else {
+		sourceNode = NetworkedNode{
+			Id:     msg.SenderId,
+			Groups: make(map[string]NexusGroup),
+		}
 	}
-	if err := tg.IPV4.SetControlMessage(ipv4.FlagSrc, true); err != nil {
-		log.Printf("failed to set control src msg on group: %v with err: %v\n", tg.Addr, err)
+
+	sourceNode.LastSeen = time.Now()
+	switch msg.Routing.MessageType {
+	case Ping:
+		return
+	case Connect:
+		if len(n.Groups) > 0 {
+			outputSet := make([]NexusGroup, 0)
+			for _, ng := range n.Groups {
+				if ng.Group.Private {
+					continue
+				}
+
+				outputSet = append(outputSet, NexusGroup{
+					Address: ng.Group.Address,
+					Id:      ng.Group.Id,
+					Private: ng.Group.Private,
+				})
+			}
+			n.BroadcastGroup.Output <- NodeMessage{
+				SenderId: n.Id,
+				Routing: MessageRouting{
+					MessageType: GroupInfo,
+				},
+				Data: map[string]interface{}{
+					"groups": outputSet,
+				},
+			}
+		}
+
+		return
+	case Message:
+		inputStream <- msg.Data
+	case GroupInfo:
+		marshed, _ := json.Marshal(msg.Data["groups"])
+		var groupList []NexusGroup
+		json.Unmarshal(marshed, &groupList)
+		for _, gi := range groupList {
+			g := gi
+			if _, ok := n.Groups[g.Id]; !ok {
+				n.Groups[g.Id] = ConnectedNexusGroup{
+					Group: g,
+				}
+			}
+			sourceNode.Groups[g.Id] = g
+		}
 	}
-	if err := tg.IPV4.SetMulticastInterface(intf); err != nil {
-		// error handling
-		log.Printf("write err: %v\n", err)
+
+	n.Network[msg.SenderId] = sourceNode
+
+}
+
+func (n Node) Run() {
+	go n.HandleBroadcastStream()
+	go n.HandleConnectStream()
+}
+
+func (n Node) HandleBroadcastStream() {
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		tryLimit := 3
+		tryCount := 0
+
+		for range ticker.C {
+			if len(n.Groups) > 0 {
+				break
+			}
+
+			tryCount++
+			if tryCount == tryLimit {
+				break
+			}
+		}
+
+		if len(n.Groups) == 0 {
+			ng := NewGroup("", NexusGroupAddress{
+				IP:   net.IPv4(224, 0, 0, 1),
+				Port: 0,
+			})
+			n.Groups[ng.Id] = ConnectedNexusGroup{
+				Group: ng,
+			}
+			n.ConnectStream <- ng
+		} else {
+			for _, ng := range n.Groups {
+				if !ng.Group.Connection.Connected && !ng.Group.Private {
+					n.ConnectStream <- ng.Group
+				}
+			}
+		}
+	}()
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		for range ticker.C {
+			n.BroadcastGroup.Output <- NodeMessage{
+				SenderId: n.Id,
+				Routing: MessageRouting{
+					DestinationAddress: n.BroadcastGroup.Group.Address.Address,
+					MessageType:        Ping,
+				},
+			}
+		}
+	}()
+	n.BroadcastGroup.InputHandler = n.BroadcastInputHandler
+	n.BroadcastGroup.Group.Connect(n.Config.Intf)
+	n.BroadcastGroup.Group.Connection.Connected = true
+	n.BroadcastGroup.Output <- NodeMessage{
+		SenderId: n.Id,
+		Routing: MessageRouting{
+			DestinationAddress: n.BroadcastGroup.Group.Address.Address,
+			MessageType:        Connect,
+		},
 	}
-	// if err := tg.IPV4.SetMulticastLoopback(false); err != nil {
-	// 	log.Printf("write err: %v\n", err)
-	// }
+	n.BroadcastGroup.Run(n.Id)
+}
+
+func (n Node) ConnectGroup(ngc NexusGroup) {
+	ng := ConnectedNexusGroup{
+		Group:  ngc,
+		Output: make(chan NodeMessage, 10),
+		Input:  make(chan interface{}, 10),
+	}
+	log.Printf("N: %v, NGC: %v\n", n.Id, ngc.Id)
+	ng.Group.Connect(n.Config.Intf)
+	ng.Group.Connection.Connected = true
+	if ng.InputHandler == nil {
+		ng.InputHandler = n.BroadcastInputHandler
+	}
+	go func() {
+		ng.Run(n.Id)
+	}()
+	ng.Output <- NodeMessage{
+		SenderId: n.Id,
+		Routing: MessageRouting{
+			DestinationAddress: ng.Group.Address.Address,
+			MessageType:        Connect,
+		},
+	}
+	n.Groups[ng.Group.Id] = ng
+	log.Print("Group connected\n")
 }
