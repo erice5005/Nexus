@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -20,7 +19,7 @@ func main() {
 	// time.Sleep(1 * time.Second)
 	commonId := "commongroup"
 	// go func() {
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 250; i++ {
 		nn := nexus.NewNode(nexus.NodeConfig{}, fmt.Sprintf("node %v", i))
 
 		nn.ConnectGroup(nexus.NewGroup(
@@ -39,19 +38,27 @@ func main() {
 			evenGroup.Private = true
 			nn.ConnectGroup(evenGroup)
 		}
+		if i%5 == 0 {
+			evenGroup := nexus.NewGroup("five", nexus.NexusGroupAddress{
+				IP:   net.IPv4(224, 0, 0, 4),
+				Port: 5555,
+			})
+			evenGroup.Private = true
+			nn.ConnectGroup(evenGroup)
+		}
 		nn.Run()
 		log.Printf("Running: %v\n", nn.Id)
 		// go func() {
-		for _, g := range nn.Groups {
-			go func() {
-				for msg := range g.Input {
-					log.Printf("Node: %v, Group: %v, Message: %v\n", nn.Id, g.Group.Id, msg)
-				}
-			}()
-		}
+		// for _, g := range nn.Groups {
+		// 	go func() {
+		// 		for msg := range g.Input {
+		// 			log.Printf("Node: %v, Group: %v, Message: %v\n", nn.Id, g.Group.Id, msg)
+		// 		}
+		// 	}()
+		// }
 		activeNodes = append(activeNodes, nn)
 		// }
-		time.Sleep(500 * time.Millisecond)
+		// time.Sleep(500 * time.Millisecond)
 	}
 	// }()
 	go func() {
@@ -86,11 +93,11 @@ func main() {
 	http.HandleFunc("/", func(rw http.ResponseWriter, r *http.Request) {
 		out := make([]string, 0)
 		for _, nx := range activeNodes {
-			b, err := json.MarshalIndent(nx.Network, "", "  ")
-			if err != nil {
-				fmt.Println("error:", err)
-			}
-			out = append(out, fmt.Sprintf("Id: %v, Seen: %v, Groups: %v\n", nx.Id, string(b), len(nx.Groups)))
+			// b, err := json.MarshalIndent(nx.Network, "", "  ")
+			// if err != nil {
+			// 	fmt.Println("error:", err)
+			// }
+			out = append(out, fmt.Sprintf("Id: %v, Seen: %v, Groups: %v\n", nx.Id, len(nx.Network), len(nx.Groups)))
 		}
 		fmt.Fprint(rw, strings.Join(out, "\n"))
 	})

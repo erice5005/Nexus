@@ -6,6 +6,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -23,8 +24,13 @@ type Node struct {
 	BroadcastGroup ConnectedNexusGroup
 	Groups         map[string]ConnectedNexusGroup
 	ConnectStream  chan NexusGroup
+	Locks          NodeLocks
 }
 
+type NodeLocks struct {
+	NetworkMU sync.RWMutex
+	GroupsMU  sync.RWMutex
+}
 type ConnectedNexusGroup struct {
 	Group         NexusGroup
 	Output        chan NodeMessage
@@ -130,7 +136,7 @@ func NewNode(conf NodeConfig, id string) *Node {
 			IP:   net.IPv4(224, 0, 0, 250),
 			Port: 9999,
 		}),
-		Output:       make(chan NodeMessage, 10),
+		Output:       make(chan NodeMessage, 10000),
 		Input:        make(chan interface{}, 10),
 		InputHandler: n.BroadcastInputHandler,
 	}
@@ -138,7 +144,7 @@ func NewNode(conf NodeConfig, id string) *Node {
 	return n
 }
 
-func (n Node) HandleConnectStream() {
+func (n *Node) HandleConnectStream() {
 	for ng := range n.ConnectStream {
 		if ng.Private {
 			continue
@@ -233,7 +239,7 @@ func (ng ConnectedNexusGroup) Run(senderId string) {
 	log.Printf("run ended: %v\n", ng.Group.Id)
 }
 
-func (n Node) BroadcastInputHandler(inputStream chan interface{}, cm *ipv4.ControlMessage, data []byte, src net.Addr) {
+func (n *Node) BroadcastInputHandler(inputStream chan interface{}, cm *ipv4.ControlMessage, data []byte, src net.Addr) {
 	msg := MsgFromJson(data)
 	if msg.SenderId == "" {
 		return
@@ -243,6 +249,7 @@ func (n Node) BroadcastInputHandler(inputStream chan interface{}, cm *ipv4.Contr
 	}
 
 	var sourceNode NetworkedNode
+	n.Locks.NetworkMU.RLock()
 	if val, ok := n.Network[msg.SenderId]; ok {
 		sourceNode = val
 	} else {
@@ -251,7 +258,7 @@ func (n Node) BroadcastInputHandler(inputStream chan interface{}, cm *ipv4.Contr
 			Groups: make(map[string]NexusGroup),
 		}
 	}
-
+	n.Locks.NetworkMU.RUnlock()
 	sourceNode.LastSeen = time.Now()
 	switch msg.Routing.MessageType {
 	case Ping:
@@ -290,25 +297,28 @@ func (n Node) BroadcastInputHandler(inputStream chan interface{}, cm *ipv4.Contr
 		json.Unmarshal(marshed, &groupList)
 		for _, gi := range groupList {
 			g := gi
+			n.Locks.GroupsMU.Lock()
 			if _, ok := n.Groups[g.Id]; !ok {
 				n.Groups[g.Id] = ConnectedNexusGroup{
 					Group: g,
 				}
 			}
 			sourceNode.Groups[g.Id] = g
+			n.Locks.GroupsMU.Unlock()
 		}
 	}
-
+	n.Locks.NetworkMU.Lock()
 	n.Network[msg.SenderId] = sourceNode
+	n.Locks.NetworkMU.Unlock()
 
 }
 
-func (n Node) Run() {
+func (n *Node) Run() {
 	go n.HandleBroadcastStream()
 	go n.HandleConnectStream()
 }
 
-func (n Node) HandleBroadcastStream() {
+func (n *Node) HandleBroadcastStream() {
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		tryLimit := 3
@@ -367,10 +377,10 @@ func (n Node) HandleBroadcastStream() {
 	n.BroadcastGroup.Run(n.Id)
 }
 
-func (n Node) ConnectGroup(ngc NexusGroup) {
+func (n *Node) ConnectGroup(ngc NexusGroup) {
 	ng := ConnectedNexusGroup{
 		Group:  ngc,
-		Output: make(chan NodeMessage, 10),
+		Output: make(chan NodeMessage, 10000),
 		Input:  make(chan interface{}, 10),
 	}
 	log.Printf("N: %v, NGC: %v\n", n.Id, ngc.Id)
